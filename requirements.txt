@@ -3,4 +3,5 @@ pandas
 numpy
 scikit-learn
 mediapipe
+opencv-python-headless
 pillow
