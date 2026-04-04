@@ -31,16 +31,29 @@ def home():
 @app.route("/predict", methods=["POST"])
 def predict():
     try:
-        data = request.json["landmarks"]
+        data = request.json.get("landmarks")
+
+        if data is None:
+            return jsonify({"error": "No landmarks provided"})
+
+        if len(data) != len(HEADERS):
+            return jsonify({
+                "error": f"Expected {len(HEADERS)} values, got {len(data)}"
+            })
 
         X = pd.DataFrame([data], columns=HEADERS)
         X_scaled = scaler.transform(X)
 
         pred = model.predict(X_scaled)[0]
 
+        label_map = {
+            "C": "Correct",
+            "L": "Lean Back"
+        }
+
         return jsonify({
-            "prediction": int(pred),
-            "message": "Correct" if pred == 0 else "Lean Back"
+            "prediction": str(pred),
+            "message": label_map.get(pred, "Unknown")
         })
 
     except Exception as e:
