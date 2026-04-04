@@ -43,8 +43,7 @@ pose = mp_pose.Pose()
 # Extract Landmarks
 # ==============================
 def extract_landmarks(image):
-    image_rgb = image.copy()
-    results = pose.process(image_rgb)
+    results = pose.process(image)
 
     if not results.pose_landmarks:
         return None
@@ -76,8 +75,8 @@ def predict_image():
 
         file = request.files["image"]
 
-        # قراءة الصورة بدون OpenCV
-        image = Image.open(io.BytesIO(file.read()))
+        # قراءة الصورة باستخدام PIL بدل cv2
+        image = Image.open(io.BytesIO(file.read())).convert("RGB")
         image = np.array(image)
 
         landmarks = extract_landmarks(image)
