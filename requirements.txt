@@ -3,4 +3,4 @@ pandas
 numpy
 scikit-learn
 mediapipe
-opencv-python-headless
+opencv-python==4.6.0.66
