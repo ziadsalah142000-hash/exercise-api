@@ -3,8 +3,9 @@ import pickle
 import pandas as pd
 import numpy as np
 import os
-import cv2
 import mediapipe as mp
+from PIL import Image
+import io
 
 app = Flask(__name__)
 
@@ -42,7 +43,7 @@ pose = mp_pose.Pose()
 # Extract Landmarks
 # ==============================
 def extract_landmarks(image):
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image_rgb = image.copy()
     results = pose.process(image_rgb)
 
     if not results.pose_landmarks:
@@ -66,38 +67,6 @@ def extract_landmarks(image):
 def home():
     return "Bicep Image API Running 🔥"
 
-# ----------- JSON API (landmarks) -----------
-@app.route("/predict", methods=["POST"])
-def predict():
-    try:
-        data = request.json.get("landmarks")
-
-        if data is None:
-            return jsonify({"error": "No landmarks provided"})
-
-        if len(data) != len(HEADERS):
-            return jsonify({
-                "error": f"Expected {len(HEADERS)} values, got {len(data)}"
-            })
-
-        X = pd.DataFrame([data], columns=HEADERS)
-        X_scaled = scaler.transform(X)
-
-        pred = model.predict(X_scaled)[0]
-
-        label_map = {
-            "C": "Correct",
-            "L": "Lean Back"
-        }
-
-        return jsonify({
-            "prediction": str(pred),
-            "message": label_map.get(pred, "Unknown")
-        })
-
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
 # ----------- Image API -----------
 @app.route("/predict-image", methods=["POST"])
 def predict_image():
@@ -107,13 +76,17 @@ def predict_image():
 
         file = request.files["image"]
 
-        file_bytes = np.frombuffer(file.read(), np.uint8)
-        image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        # قراءة الصورة بدون OpenCV
+        image = Image.open(io.BytesIO(file.read()))
+        image = np.array(image)
 
         landmarks = extract_landmarks(image)
 
         if landmarks is None:
             return jsonify({"error": "No person detected"})
+
+        if len(landmarks) != len(HEADERS):
+            return jsonify({"error": "Landmarks size mismatch"})
 
         X = pd.DataFrame([landmarks], columns=HEADERS)
         X_scaled = scaler.transform(X)
