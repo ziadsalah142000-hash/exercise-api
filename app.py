@@ -162,7 +162,7 @@ def detect_adhd_exercise(landmarks):
         return "Child's Pose"
     if lk_angle > 160 and rk_angle > 160 and wrist_y > hip_y:
         return "Deep Breathing"
-    return "Keep Going!"
+    return "Awesome! Keep Moving 🌟"
 
 # ==============================
 # Helper
