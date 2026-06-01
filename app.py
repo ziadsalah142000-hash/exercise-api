@@ -9,6 +9,10 @@ from mediapipe.tasks.python import vision
 from PIL import Image
 import io
 import urllib.request
+import cv2
+import base64
+from mediapipe.python.solutions import drawing_utils as mp_drawing
+from mediapipe.python.solutions import pose as mp_pose
 
 app = Flask(__name__)
 
@@ -167,13 +171,29 @@ def extract_landmarks(image_array, lm_indices):
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_array)
     result = detector.detect(mp_image)
     if not result.pose_landmarks:
-        return None
+        return None, None
     landmarks = result.pose_landmarks[0]
     row = []
     for idx in lm_indices:
         lm = landmarks[idx]
         row += [lm.x, lm.y, lm.z, lm.visibility]
-    return row
+
+    # Create a copy and draw the skeleton lines (Aligned to 4 spaces)
+    annotated_image = image_array.copy()
+    
+    # Manually convert the landmark format for drawing_utils
+    from mediapipe.framework.formats import landmark_pb2
+    pose_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
+    for lm in landmarks:
+        pose_landmarks_proto.landmark.add(x=lm.x, y=lm.y, z=lm.z, visibility=lm.visibility)
+
+    mp_drawing.draw_landmarks(
+        annotated_image,
+        pose_landmarks_proto,
+        mp_pose.POSE_CONNECTIONS
+    )
+
+    return row, annotated_image
 
 
 def predict_exercise(exercise, lm_indices, headers, scaler, model, label_map):
@@ -185,7 +205,7 @@ def predict_exercise(exercise, lm_indices, headers, scaler, model, label_map):
         image = Image.open(io.BytesIO(file.read())).convert("RGB")
         image = np.array(image)
 
-        landmarks = extract_landmarks(image, lm_indices)
+        landmarks, annotated_image = extract_landmarks(image, lm_indices)        
         if landmarks is None:
             return jsonify({"error": "No person detected"})
 
@@ -193,13 +213,20 @@ def predict_exercise(exercise, lm_indices, headers, scaler, model, label_map):
         X_scaled = scaler.transform(X)
         pred = model.predict(X_scaled)[0]
 
+        # Convert the drawn image to Base64 (Aligned to 8 spaces)
+        annotated_image_bgr = cv2.cvtColor(annotated_image, cv2.COLOR_RGB2BGR)
+        _, buffer = cv2.imencode('.jpg', annotated_image_bgr)
+        image_base64 = base64.b64encode(buffer).decode('utf-8')
+
         return jsonify({
             "exercise": exercise,
             "prediction": str(pred),
-            "message": label_map.get(str(pred), "Unknown")
+            "message": label_map.get(str(pred), "Unknown"),
+            "image": image_base64
         })
     except Exception as e:
         return jsonify({"error": str(e)})
+
 
 # ==============================
 # Routes
