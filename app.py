@@ -162,7 +162,7 @@ def detect_adhd_exercise(landmarks):
         return "Child's Pose"
     if lk_angle > 160 and rk_angle > 160 and wrist_y > hip_y:
         return "Deep Breathing"
-    return "Awesome! Keep Moving 🌟"
+    return "Keep Going!"
 
 # ==============================
 # Helper
@@ -171,7 +171,7 @@ def extract_landmarks(image_array, lm_indices):
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_array)
     result = detector.detect(mp_image)
     if not result.pose_landmarks:
-        return None, None
+        return None, None, None
     landmarks = result.pose_landmarks[0]
     row = []
     for idx in lm_indices:
@@ -193,7 +193,7 @@ def extract_landmarks(image_array, lm_indices):
         mp_pose.POSE_CONNECTIONS
     )
 
-    return row, annotated_image
+    return row, annotated_image, landmarks
 
 
 def predict_exercise(exercise, lm_indices, headers, scaler, model, label_map):
@@ -205,11 +205,11 @@ def predict_exercise(exercise, lm_indices, headers, scaler, model, label_map):
         image = Image.open(io.BytesIO(file.read())).convert("RGB")
         image = np.array(image)
 
-        landmarks, annotated_image = extract_landmarks(image, lm_indices)        
-        if landmarks is None:
+        features, annotated_image, raw_landmarks = extract_landmarks(image, lm_indices)        
+        if features is None:
             return jsonify({"error": "No person detected"})
 
-        X = pd.DataFrame([landmarks], columns=headers)
+        X = pd.DataFrame([features], columns=headers)
         X_scaled = scaler.transform(X)
         pred = model.predict(X_scaled)[0]
 
@@ -218,11 +218,14 @@ def predict_exercise(exercise, lm_indices, headers, scaler, model, label_map):
         _, buffer = cv2.imencode('.jpg', annotated_image_bgr)
         image_base64 = base64.b64encode(buffer).decode('utf-8')
 
+        landmarks_list = [{"id": i, "x": lm.x, "y": lm.y, "z": lm.z} for i, lm in enumerate(raw_landmarks)]
+
         return jsonify({
             "exercise": exercise,
             "prediction": str(pred),
             "message": label_map.get(str(pred), "Unknown"),
-            "image": image_base64
+            "image": image_base64,
+            "landmarks": landmarks_list
         })
     except Exception as e:
         return jsonify({"error": str(e)})
@@ -270,9 +273,12 @@ def predict_adhd():
         landmarks = result.pose_landmarks[0]
         exercise = detect_adhd_exercise(landmarks)
 
+        landmarks_list = [{"id": i, "x": lm.x, "y": lm.y, "z": lm.z} for i, lm in enumerate(landmarks)]
+
         return jsonify({
             "exercise": "adhd",
-            "message": exercise
+            "message": exercise,
+            "landmarks": landmarks_list
         })
     except Exception as e:
         return jsonify({"error": str(e)})
