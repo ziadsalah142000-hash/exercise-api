@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_sock import Sock
 import pickle
 import pandas as pd
 import numpy as np
@@ -11,10 +12,12 @@ import io
 import urllib.request
 import cv2
 import base64
+import json
 from mediapipe.python.solutions import drawing_utils as mp_drawing
 from mediapipe.python.solutions import pose as mp_pose
 
 app = Flask(__name__)
+sock = Sock(app)
 
 # ==============================
 # Download pose model if needed
@@ -59,14 +62,9 @@ with open("models/plank_model/LR_model.pkl", "rb") as f:
 # ==============================
 # Landmarks Indices
 # ==============================
-# Bicep: nose, shoulders, elbows, wrists, hips
-BICEP_LMS = [0, 11, 12, 14, 13, 16, 15, 23, 24]
-
-# Squat: nose, shoulders, hips, knees, ankles (9 landmarks = 36 features)
-SQUAT_LMS = [0, 11, 12, 23, 24, 25, 26, 27, 28]
-
-# Plank: nose, shoulders, elbows, wrists, hips, knees, ankles, heels, foot index (17 landmarks = 68 features)
-PLANK_LMS = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+BICEP_LMS  = [0, 11, 12, 14, 13, 16, 15, 23, 24]
+SQUAT_LMS  = [0, 11, 12, 23, 24, 25, 26, 27, 28]
+PLANK_LMS  = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
 
 # ==============================
 # Headers
@@ -122,6 +120,12 @@ BICEP_LABELS = {"C": "Correct", "L": "Lean Back"}
 SQUAT_LABELS = {"0": "Down", "1": "Up"}
 PLANK_LABELS = {"0": "Correct", "1": "High Lower Back", "2": "Low Lower Back"}
 
+EXERCISE_CONFIG = {
+    "bicep": (BICEP_LMS, BICEP_HEADERS, bicep_scaler, bicep_model, BICEP_LABELS),
+    "squat": (SQUAT_LMS, SQUAT_HEADERS, squat_scaler, squat_model, SQUAT_LABELS),
+    "plank": (PLANK_LMS, PLANK_HEADERS, plank_scaler, plank_model, PLANK_LABELS),
+}
+
 # ==============================
 # ADHD Helper
 # ==============================
@@ -136,16 +140,11 @@ def detect_adhd_exercise(landmarks):
         lm = landmarks[idx]
         return [lm.x, lm.y]
 
-    ls = get_point(11)
-    rs = get_point(12)
-    lh = get_point(23)
-    rh = get_point(24)
-    lk = get_point(25)
-    rk = get_point(26)
-    la = get_point(27)
-    ra = get_point(28)
-    lw = get_point(15)
-    rw = get_point(16)
+    ls = get_point(11); rs = get_point(12)
+    lh = get_point(23); rh = get_point(24)
+    lk = get_point(25); rk = get_point(26)
+    la = get_point(27); ra = get_point(28)
+    lw = get_point(15); rw = get_point(16)
 
     lk_angle = calculate_angle(lh, lk, la)
     rk_angle = calculate_angle(rh, rk, ra)
@@ -165,123 +164,158 @@ def detect_adhd_exercise(landmarks):
     return "Keep Going!"
 
 # ==============================
-# Helper
+# Core processing
 # ==============================
-def extract_landmarks(image_array, lm_indices):
+def process_image_bytes(image_bytes, lm_indices, headers, scaler, model, label_map, exercise_name):
+    """Shared logic for both HTTP and WebSocket handlers."""
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image_array = np.array(image)
+
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_array)
     result = detector.detect(mp_image)
+
     if not result.pose_landmarks:
-        return None, None, None
+        return {"error": "No person detected"}
+
     landmarks = result.pose_landmarks[0]
     row = []
     for idx in lm_indices:
         lm = landmarks[idx]
         row += [lm.x, lm.y, lm.z, lm.visibility]
 
-    # Create a copy and draw the skeleton lines (Aligned to 4 spaces)
-    annotated_image = image_array.copy()
-    
-    # Manually convert the landmark format for drawing_utils
+    # Draw skeleton
+    annotated = image_array.copy()
     from mediapipe.framework.formats import landmark_pb2
-    pose_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
+    proto = landmark_pb2.NormalizedLandmarkList()
     for lm in landmarks:
-        pose_landmarks_proto.landmark.add(x=lm.x, y=lm.y, z=lm.z, visibility=lm.visibility)
+        proto.landmark.add(x=lm.x, y=lm.y, z=lm.z, visibility=lm.visibility)
+    mp_drawing.draw_landmarks(annotated, proto, mp_pose.POSE_CONNECTIONS)
 
-    mp_drawing.draw_landmarks(
-        annotated_image,
-        pose_landmarks_proto,
-        mp_pose.POSE_CONNECTIONS
-    )
+    # Predict
+    X = pd.DataFrame([row], columns=headers)
+    X_scaled = scaler.transform(X)
+    pred = model.predict(X_scaled)[0]
 
-    return row, annotated_image, landmarks
+    # Encode annotated image
+    annotated_bgr = cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
+    _, buffer = cv2.imencode('.jpg', annotated_bgr)
+    image_b64 = base64.b64encode(buffer).decode('utf-8')
+
+    landmarks_list = [{"id": i, "x": lm.x, "y": lm.y, "z": lm.z} for i, lm in enumerate(landmarks)]
+
+    return {
+        "exercise": exercise_name,
+        "prediction": str(pred),
+        "message": label_map.get(str(pred), "Unknown"),
+        "image": image_b64,
+        "landmarks": landmarks_list
+    }
 
 
-def predict_exercise(exercise, lm_indices, headers, scaler, model, label_map):
-    try:
-        if "image" not in request.files:
-            return jsonify({"error": "No image uploaded"})
+def process_adhd_bytes(image_bytes):
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image_array = np.array(image)
 
-        file = request.files["image"]
-        image = Image.open(io.BytesIO(file.read())).convert("RGB")
-        image = np.array(image)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_array)
+    result = detector.detect(mp_image)
 
-        features, annotated_image, raw_landmarks = extract_landmarks(image, lm_indices)        
-        if features is None:
-            return jsonify({"error": "No person detected"})
+    if not result.pose_landmarks:
+        return {"error": "No person detected"}
 
-        X = pd.DataFrame([features], columns=headers)
-        X_scaled = scaler.transform(X)
-        pred = model.predict(X_scaled)[0]
+    landmarks = result.pose_landmarks[0]
+    exercise  = detect_adhd_exercise(landmarks)
+    lm_list   = [{"id": i, "x": lm.x, "y": lm.y, "z": lm.z} for i, lm in enumerate(landmarks)]
 
-        # Convert the drawn image to Base64 (Aligned to 8 spaces)
-        annotated_image_bgr = cv2.cvtColor(annotated_image, cv2.COLOR_RGB2BGR)
-        _, buffer = cv2.imencode('.jpg', annotated_image_bgr)
-        image_base64 = base64.b64encode(buffer).decode('utf-8')
-
-        landmarks_list = [{"id": i, "x": lm.x, "y": lm.y, "z": lm.z} for i, lm in enumerate(raw_landmarks)]
-
-        return jsonify({
-            "exercise": exercise,
-            "prediction": str(pred),
-            "message": label_map.get(str(pred), "Unknown"),
-            "image": image_base64,
-            "landmarks": landmarks_list
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)})
+    return {"exercise": "adhd", "message": exercise, "landmarks": lm_list}
 
 
 # ==============================
-# Routes
+# HTTP Routes (kept as-is)
 # ==============================
 @app.route("/")
 def home():
-    return "Exercise Pose Detection API 💪 | Endpoints: /predict/bicep | /predict/squat | /predict/plank | /predict/adhd"
+    return (
+        "Exercise Pose Detection API 💪 | "
+        "HTTP: /predict/bicep | /predict/squat | /predict/plank | /predict/adhd | "
+        "WebSocket: /ws/bicep | /ws/squat | /ws/plank | /ws/adhd"
+    )
 
-
-@app.route("/predict/bicep", methods=["POST"])
-def predict_bicep():
-    return predict_exercise("bicep", BICEP_LMS, BICEP_HEADERS, bicep_scaler, bicep_model, BICEP_LABELS)
-
-
-@app.route("/predict/squat", methods=["POST"])
-def predict_squat():
-    return predict_exercise("squat", SQUAT_LMS, SQUAT_HEADERS, squat_scaler, squat_model, SQUAT_LABELS)
-
-
-@app.route("/predict/plank", methods=["POST"])
-def predict_plank():
-    return predict_exercise("plank", PLANK_LMS, PLANK_HEADERS, plank_scaler, plank_model, PLANK_LABELS)
-
-
-@app.route("/predict/adhd", methods=["POST"])
-def predict_adhd():
+def http_predict(exercise_name):
     try:
         if "image" not in request.files:
             return jsonify({"error": "No image uploaded"})
-
-        file = request.files["image"]
-        image = Image.open(io.BytesIO(file.read())).convert("RGB")
-        image = np.array(image)
-
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
-        result = detector.detect(mp_image)
-
-        if not result.pose_landmarks:
-            return jsonify({"error": "No person detected"})
-
-        landmarks = result.pose_landmarks[0]
-        exercise = detect_adhd_exercise(landmarks)
-
-        landmarks_list = [{"id": i, "x": lm.x, "y": lm.y, "z": lm.z} for i, lm in enumerate(landmarks)]
-
-        return jsonify({
-            "exercise": "adhd",
-            "message": exercise,
-            "landmarks": landmarks_list
-        })
+        image_bytes = request.files["image"].read()
+        if exercise_name == "adhd":
+            return jsonify(process_adhd_bytes(image_bytes))
+        lm_indices, headers, scaler, model, label_map = EXERCISE_CONFIG[exercise_name]
+        return jsonify(process_image_bytes(image_bytes, lm_indices, headers, scaler, model, label_map, exercise_name))
     except Exception as e:
         return jsonify({"error": str(e)})
+
+@app.route("/predict/bicep", methods=["POST"])
+def predict_bicep(): return http_predict("bicep")
+
+@app.route("/predict/squat", methods=["POST"])
+def predict_squat(): return http_predict("squat")
+
+@app.route("/predict/plank", methods=["POST"])
+def predict_plank(): return http_predict("plank")
+
+@app.route("/predict/adhd", methods=["POST"])
+def predict_adhd(): return http_predict("adhd")
+
+
+# ==============================
+# WebSocket Routes
+# ==============================
+# Flutter sends frames as JSON: { "frame": "<base64 jpeg>" }
+# Server replies with JSON:     { "exercise": "...", "prediction": "...", "message": "...", "landmarks": [...] }
+# Note: annotated image is omitted from WS responses to keep latency low.
+#       Flutter renders its own overlay using the landmarks array.
+
+def ws_predict(ws, exercise_name):
+    """Generic WebSocket handler for all exercise types."""
+    while True:
+        try:
+            data = ws.receive()
+            if data is None:
+                break
+
+            # Accept raw bytes OR JSON { "frame": "<base64>" }
+            if isinstance(data, bytes):
+                image_bytes = data
+            else:
+                payload = json.loads(data)
+                image_bytes = base64.b64decode(payload["frame"])
+
+            if exercise_name == "adhd":
+                result = process_adhd_bytes(image_bytes)
+            else:
+                lm_indices, headers, scaler, model, label_map = EXERCISE_CONFIG[exercise_name]
+                result = process_image_bytes(
+                    image_bytes, lm_indices, headers, scaler, model, label_map, exercise_name
+                )
+                # Drop the heavy base64 image — Flutter renders its own overlay
+                result.pop("image", None)
+
+            ws.send(json.dumps(result))
+
+        except Exception as e:
+            ws.send(json.dumps({"error": str(e)}))
+            break
+
+
+@sock.route("/ws/bicep")
+def ws_bicep(ws): ws_predict(ws, "bicep")
+
+@sock.route("/ws/squat")
+def ws_squat(ws): ws_predict(ws, "squat")
+
+@sock.route("/ws/plank")
+def ws_plank(ws): ws_predict(ws, "plank")
+
+@sock.route("/ws/adhd")
+def ws_adhd(ws): ws_predict(ws, "adhd")
 
 
 # ==============================
